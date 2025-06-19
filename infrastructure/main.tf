@@ -30,31 +30,56 @@ resource "aws_vpc" "main" {
   tags = { Name = "ror-vpc" }
 }
 
-# Private Subnets
+# Public Subnet (for ALB only)
+resource "aws_subnet" "public_alb" {
+  vpc_id                  = aws_vpc.main.id
+  cidr_block              = cidrsubnet("10.0.0.0/16", 8, 100)
+  availability_zone       = var.azs[0]
+  map_public_ip_on_launch = true
+  tags = { Name = "ror-public-alb" }
+}
+
+# Private Subnets (for ECS, RDS)
 resource "aws_subnet" "private" {
-  count             = 2
-  vpc_id            = aws_vpc.main.id
-  cidr_block        = cidrsubnet("10.0.0.0/16", 8, count.index)
-  availability_zone = var.azs[count.index]
+  count                   = 2
+  vpc_id                  = aws_vpc.main.id
+  cidr_block              = cidrsubnet("10.0.0.0/16", 8, count.index)
+  availability_zone       = var.azs[count.index]
+  map_public_ip_on_launch = false
   tags = { Name = "ror-private-${count.index}" }
 }
 
-# Internet Gateway & NAT Gateway Setup
+# Internet Gateway (for ALB)
 resource "aws_internet_gateway" "gw" {
   vpc_id = aws_vpc.main.id
 }
 
+# Public Route Table (for ALB)
+resource "aws_route_table" "public" {
+  vpc_id = aws_vpc.main.id
+
+  route {
+    cidr_block = "0.0.0.0/0"
+    gateway_id = aws_internet_gateway.gw.id
+  }
+}
+
+resource "aws_route_table_association" "public_alb" {
+  subnet_id      = aws_subnet.public_alb.id
+  route_table_id = aws_route_table.public.id
+}
+
+# NAT Gateway (for private subnet internet access)
 resource "aws_eip" "nat" {
-  domain = "vpc"
+  vpc = true
 }
 
 resource "aws_nat_gateway" "nat" {
   allocation_id = aws_eip.nat.id
-  subnet_id     = aws_subnet.private[0].id # Place NAT in 1st private subnet
+  subnet_id     = aws_subnet.public_alb.id
   depends_on    = [aws_internet_gateway.gw]
 }
 
-# Route Tables for Private Subnets
 resource "aws_route_table" "private" {
   vpc_id = aws_vpc.main.id
 
@@ -70,18 +95,18 @@ resource "aws_route_table_association" "private" {
   route_table_id = aws_route_table.private.id
 }
 
-# ECR (use existing)
-data "aws_ecr_repository" "app" {
-  name = "ror-app-repo"
-}
-
 # S3 Bucket
 resource "aws_s3_bucket" "app" {
   bucket        = "ror-app-bucket-fixed"
   force_destroy = true
 }
 
-# RDS
+# ECR
+data "aws_ecr_repository" "app" {
+  name = "ror-app-repo"
+}
+
+# RDS (Private Subnets)
 resource "aws_db_subnet_group" "default" {
   name       = "ror-db-subnet-group"
   subnet_ids = aws_subnet.private[*].id
@@ -161,11 +186,7 @@ resource "aws_security_group" "rds" {
   }
 }
 
-# ECS Cluster & IAM
-resource "aws_ecs_cluster" "main" {
-  name = "ror-cluster"
-}
-
+# IAM Role
 resource "aws_iam_role" "ecs_exec" {
   name = "ecs-exec-role"
   assume_role_policy = jsonencode({
@@ -197,6 +218,11 @@ resource "aws_iam_role_policy" "s3_policy" {
       ]
     }]
   })
+}
+
+# ECS Cluster
+resource "aws_ecs_cluster" "main" {
+  name = "ror-cluster"
 }
 
 # ECS Task Definition
@@ -234,7 +260,7 @@ resource "aws_lb" "app" {
   internal           = false
   load_balancer_type = "application"
   security_groups    = [aws_security_group.alb.id]
-  subnets            = aws_subnet.private[*].id
+  subnets            = [aws_subnet.public_alb.id]
 }
 
 resource "aws_lb_target_group" "app" {
@@ -283,6 +309,7 @@ resource "aws_ecs_service" "app" {
   depends_on = [aws_lb_listener.http]
 }
 
+# Output
 output "load_balancer_dns" {
   description = "DNS of the Application Load Balancer"
   value       = aws_lb.app.dns_name
