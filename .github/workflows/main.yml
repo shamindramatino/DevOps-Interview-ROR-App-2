@@ -35,4 +35,4 @@ jobs:
         working-directory: infrastructure
         run: |
           terraform init
-          terraform apply -auto-approve
+          terraform apply -auto-approve 
